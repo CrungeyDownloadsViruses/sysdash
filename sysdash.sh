@@ -12,10 +12,14 @@
 #
 #  Usage
 #    ./sysdash.sh                         one-shot dashboard
-#    ./sysdash.sh watch [N]               live view, refresh every N seconds (default 5)
+#    ./sysdash.sh watch [N]               auto-refreshing view, every N seconds (default 5)
 #    ./sysdash.sh live                    live view, data refresh every 0.5 s; animated plugins run up to 30 fps
+#      Scrolling (watch and live, when the dashboard is taller than the window):
+#        Up/Down or k/j   one line      PgUp/PgDn or b/space   one page
+#        Home/End or g/G  top / bottom  mouse wheel (most terminals)      q  quit
+#      Needs bash 4+ for scrolling; on bash 3.2 the view shows the top and is not scrollable.
 #    ./sysdash.sh showcase [FLAGS]        privacy-safe dashboard for screenshots
-#    ./sysdash.sh showcase FLAGS live     privacy-safe live dashboard
+#    ./sysdash.sh showcase FLAGS live     privacy-safe live dashboard (also: live showcase FLAGS)
 #    ./sysdash.sh showcase default        shorthand for: showcase sn osn g og pn opn oeip iip
 #      FLAGS: un oun sn osn g og s os em oem pn opn eip oeip iip   (or: default)
 #    ./sysdash.sh keys                    list the names of the keys you have stored (alias: kyes)
@@ -722,7 +726,8 @@ tot[st[i]]+=d
 if (st[i]==bad) { outs++; if (d>lg) lg=d }
 }
 fl=(NR==1 || st[NR-1]=="unknown")?1:0
-printf "%s %d %d %d %d %d %d %d %d\n", st[NR], ts[NR], fl, tot[good], tot[bad], tot["unknown"], ts[1], outs, lg
+printf "%s %d %d %d %d %d %d %d %d
+", st[NR], ts[NR], fl, tot[good], tot[bad], tot["unknown"], ts[1], outs, lg
 }' "$1")"
 }
 # ----------------------------------------------------------------------------
@@ -962,7 +967,7 @@ else LC+=("$(kv User "${user} ${DIM}(uid $(id -u))${RST}")"); fi
 grp=$(id -Gn 2>/dev/null | tr ' ' ',')
 [ "$OPT_SHOWCASE" = 1 ] && [ "$OPT_SHOWCASE_G" != 1 ] && grp="[hidden]"
 LC+=("$(kv Groups "$(trunc "$grp" "$vw")")")
-if [ -n "${SSH_CLIENT:-}" ]; then sess="ssh from ${SSH_CLIENT%% *}"; else if [ -t 0 ]; then sess="local $(tty 2>/dev/null | sed 's|/dev/||')"; else sess="non-interactive"; fi; fi
+if [ -n "${SSH_CLIENT:-}" ]; then sess="ssh from ${SSH_CLIENT%% *}"; else if [ -t 0 ] || [ -n "${SD_TTY_NAME:-}" ]; then sess="local $( { [ -n "${SD_TTY_NAME:-}" ] && echo "$SD_TTY_NAME" || tty 2>/dev/null; } | sed 's|/dev/||')"; else sess="non-interactive"; fi; fi
 [ "$OPT_SHOWCASE" = 1 ] && [ "$OPT_SHOWCASE_S" != 1 ] && sess="[hidden]"
 LC+=("$(kv Session "$(trunc "$sess" "$vw")")")
 who_l=$(who 2>/dev/null | awk '{print $1}' | sort -u | tr '
@@ -1682,6 +1687,106 @@ render_footer
 #  main
 # ----------------------------------------------------------------------------
 # ----------------------------------------------------------------------------
+#  scrollable viewport (live / watch views)
+#  The finished frame is split into lines and painted through a window, so a
+#  dashboard taller than the terminal can be scrolled instead of being cut off.
+#  Keys: Up/Down or k/j (1 line)  PgUp/PgDn or b/space  Home/End or g/G  q quit.
+#  Mouse wheel works in most terminals (alternate-scroll mode sends arrow keys).
+#  Needs bash 4+ for the timed key reads; on bash 3.2 the view is not scrollable.
+# ----------------------------------------------------------------------------
+VIEW_LINES=(); VIEW_N=0; VIEW_H=0; VIEW_ROWS=0; VIEW_COLS=0; SCROLL=0; SCROLL_DIRTY=0
+KEYS_OK=0; SD_STTY=""; PAINT=""; KEYNAME=""
+view_init() {
+if [ -t 0 ] && [ "${BASH_VERSINFO[0]:-3}" -ge 4 ]; then
+SD_STTY=$(stty -g 2>/dev/null) && stty -echo -icanon 2>/dev/null && KEYS_OK=1
+printf '\033[?1007h'                       # wheel -> arrow keys, without capturing the mouse
+fi
+}
+view_set_frame() { # text -> VIEW_LINES / VIEW_N
+local l
+VIEW_LINES=()
+while IFS= read -r l; do VIEW_LINES+=("$l"); done <<<"$1"
+VIEW_N=${#VIEW_LINES[@]}
+}
+view_term_size() { # -> VIEW_ROWS VIEW_COLS (honours SYSDASH_ROWS / SYSDASH_COLS)
+local r="" c=""
+read -r r c < <(stty size 2>/dev/null </dev/tty)
+case $r in ''|*[!0-9]*) r=$(tput lines 2>/dev/null);; esac
+case $c in ''|*[!0-9]*) c=$(tput cols 2>/dev/null);; esac
+VIEW_ROWS=${SYSDASH_ROWS:-${r:-50}}; VIEW_COLS=${SYSDASH_COLS:-${c:-100}}
+}
+view_geometry() { # rows -> VIEW_H (content rows; one row is kept for the status bar when scrollable), clamps SCROLL
+local rows=$1 max
+VIEW_H=$rows; [ "$VIEW_N" -gt "$rows" ] && VIEW_H=$((rows - 1))
+[ "$VIEW_H" -lt 1 ] && VIEW_H=1
+max=$((VIEW_N - VIEW_H)); [ "$max" -lt 0 ] && max=0
+[ "$SCROLL" -gt "$max" ] && SCROLL=$max
+[ "$SCROLL" -lt 0 ] && SCROLL=0
+}
+view_paint() { # rows cols -> PAINT (cursor-addressed, overwrites in place, no scrolling of the terminal)
+local rows=$1 cols=$2 i idx out="" bar last
+view_geometry "$rows"
+for ((i = 0; i < VIEW_H; i++)); do
+idx=$((SCROLL + i))
+if [ "$idx" -lt "$VIEW_N" ]; then out+=$'\033['"$((i + 1));1H${VIEW_LINES[idx]}"$'\033[K'
+else out+=$'\033['"$((i + 1));1H"$'\033[K'; fi
+done
+if [ "$VIEW_N" -gt "$rows" ]; then
+last=$((SCROLL + VIEW_H)); [ "$last" -gt "$VIEW_N" ] && last=$VIEW_N
+if [ "$UNI" = 1 ]; then bar="lines $((SCROLL + 1))-${last} of ${VIEW_N}  ${SEP}  ↑/↓ j/k scroll  ${SEP}  PgUp/PgDn  ${SEP}  g/G top/bottom  ${SEP}  q quit"
+else bar="lines $((SCROLL + 1))-${last} of ${VIEW_N}  ${SEP}  up/down j/k scroll  ${SEP}  PgUp/PgDn  ${SEP}  g/G top/bottom  ${SEP}  q quit"; fi
+out+=$'\033['"${rows};1H${DIM}$(trunc "$bar" $((cols - 1)))${RST}"$'\033[K'
+fi
+PAINT=$out
+}
+view_scroll() { # absolute offset or delta handled by caller; marks the view dirty when it moved
+local new=$1 max=$((VIEW_N - VIEW_H))
+[ "$max" -lt 0 ] && max=0
+[ "$new" -gt "$max" ] && new=$max; [ "$new" -lt 0 ] && new=0
+[ "$new" -ne "$SCROLL" ] && { SCROLL=$new; SCROLL_DIRTY=1; }
+return 0
+}
+view_read_key() { # timeout-ms: waits for a key (that doubles as the frame sleep) and applies it
+local s k r2 r3
+printf -v s '%d.%03d' $(($1 / 1000)) $(($1 % 1000))
+IFS= read -rsn1 -t "$s" k 2>/dev/null || return 1
+case $k in
+$'\033')
+IFS= read -rsn2 -t 0.02 r2 2>/dev/null
+case $r2 in
+'[A'|OA) view_scroll $((SCROLL - 1));;
+'[B'|OB) view_scroll $((SCROLL + 1));;
+'[5') IFS= read -rsn1 -t 0.02 r3 2>/dev/null; view_scroll $((SCROLL - (VIEW_H - 1)));;
+'[6') IFS= read -rsn1 -t 0.02 r3 2>/dev/null; view_scroll $((SCROLL + (VIEW_H - 1)));;
+'[H'|OH) view_scroll 0;;
+'[F'|OF) view_scroll 999999;;
+'[1'|'[7') IFS= read -rsn1 -t 0.02 r3 2>/dev/null; view_scroll 0;;
+'[4'|'[8') IFS= read -rsn1 -t 0.02 r3 2>/dev/null; view_scroll 999999;;
+esac;;
+k|K) view_scroll $((SCROLL - 1));;
+j|J) view_scroll $((SCROLL + 1));;
+b|B) view_scroll $((SCROLL - (VIEW_H - 1)));;
+' ') view_scroll $((SCROLL + (VIEW_H - 1)));;
+g) view_scroll 0;;
+G) view_scroll 999999;;
+q|Q) exit 0;;
+esac
+return 0
+}
+view_idle_ms() { # wait ms, repainting immediately whenever the user scrolls (plain watch / live loop)
+local end d first=1
+now_ms; end=$((NOW_MS + $1))
+while :; do
+now_ms; d=$((end - NOW_MS))
+if [ "$d" -le 0 ]; then [ "$first" = 1 ] || break; d=2; fi   # always poll input at least once
+first=0
+if [ "$KEYS_OK" = 1 ]; then
+view_read_key "$d"
+if [ "$SCROLL_DIRTY" = 1 ]; then SCROLL_DIRTY=0; view_term_size; view_paint "$VIEW_ROWS" "$VIEW_COLS"; printf '%s' "$PAINT"; fi
+else sleep_ms "$d"; fi
+done
+}
+# ----------------------------------------------------------------------------
 #  live animation engine (plugins with SYSDASH_PLUGIN_FPS, up to 30 fps)
 #  A background renderer builds the whole dashboard (slow: it gathers data) and
 #  publishes it to a temp dir. The foreground loop paints the newest frame and
@@ -1706,7 +1811,7 @@ live_renderer() { # dir  (background process: full dashboard every 0.5 s)
 local dir=$1 seq=0 t0 p nl
 SD_LIVE_BG=1
 # data gathering must never steal CPU from the animation (matters on 1-core hosts)
-[ -n "${BASHPID:-}" ] && have renice && renice -n 10 -p "$BASHPID" >/dev/null 2>&1
+[ -n "${BASHPID:-}" ] && have renice && renice -n 3 -p "$BASHPID" >/dev/null 2>&1
 while :; do
 now_ms; t0=$NOW_MS
 render_all >"$dir/frame.tmp" 2>/dev/null
@@ -1718,7 +1823,7 @@ now_ms; sleep_ms $((500 - (NOW_MS - t0)))
 done
 }
 LV_ID=(); LV_ROW=(); LV_COL=(); LV_W=(); LV_H=(); LV_FPS=(); LV_NEXT=(); LV_FN=()
-LV_STATIC=""; LV_ROWS=0; LV_COLS=0; LV_OFF=0; LV_T0=0; LIVE_OUT=""; LIVE_BG=""; LIVE_DIR=""
+LV_STATIC=""; LV_ROWS=0; LV_COLS=0; LV_T0=0; LIVE_OUT=""; LIVE_BG=""; LIVE_DIR=""
 live_load_layout() { # dir -> LV_* (static frame + animated panel table)
 local dir=$1 line first=1 id row col w h fps n j nl=0
 local -a old_id old_fn
@@ -1734,33 +1839,36 @@ for ((j = 0; j < ${#old_id[@]}; j++)); do [ "${old_id[j]}" = "$id" ] && { n=${ol
 LV_ID+=("$id"); LV_ROW+=("$row"); LV_COL+=("$col"); LV_W+=("$w"); LV_H+=("$h"); LV_FPS+=("$fps"); LV_NEXT+=(0); LV_FN+=("$n")
 done <"$dir/layout"
 LV_STATIC=$(<"$dir/frame")
-LV_OFF=$((nl - LV_ROWS)); [ "$LV_OFF" -lt 0 ] && LV_OFF=0     # a frame taller than the window scrolls
+view_set_frame "$LV_STATIC"
 return 0
 }
 live_draw_panel() { # index elapsed-ms -> appends cursor-addressed rows to LIVE_OUT
 local i=$1 ms=$2 id w row col h text line k=0 r
 id=${LV_ID[i]}; w=${LV_W[i]}; row=${LV_ROW[i]}; col=${LV_COL[i]}; h=${LV_H[i]}
-text=$(set_width "$w"; "sysdash_plugin_${id}_frame" "$w" "${LV_FN[i]}" "$ms" 2>/dev/null) || return 0
+set_width "$w"                                   # no subshell: frame output goes through a file ($(<f) forks nothing)
+"sysdash_plugin_${id}_frame" "$w" "${LV_FN[i]}" "$ms" >"$LIVE_DIR/f" 2>/dev/null || return 0
+text=$(<"$LIVE_DIR/f")
 while IFS= read -r line; do
 [ "$k" -lt $((h - 2)) ] || break                 # content rows only; the box stays untouched
-r=$((row + k + 2 - LV_OFF)); k=$((k + 1))
-[ "$r" -ge 1 ] && [ "$r" -le "$LV_ROWS" ] && LIVE_OUT+=$'\033['"${r};${col}H${line}"
+r=$((row + k + 2 - SCROLL)); k=$((k + 1))
+[ "$r" -ge 1 ] && [ "$r" -le "$VIEW_H" ] && LIVE_OUT+=$'\033['"${r};${col}H${line}"
 done <<<"$text"
 }
 live_stop() {
 [ -n "${LIVE_BG:-}" ] && kill "$LIVE_BG" 2>/dev/null
 [ -n "${LIVE_DIR:-}" ] && rm -rf "$LIVE_DIR"
-printf '\033[?7h\033[?25h\033[?1049l'
+[ -n "${SD_STTY:-}" ] && stty "$SD_STTY" 2>/dev/null </dev/tty
+printf '\033[?1007l\033[?7h\033[?25h\033[?1049l'
 }
 live_anim_loop() {
 local dir last_seq="" seq i period n wake d ms redraw started=0
 dir=$(mktemp -d "${TMPDIR:-/tmp}/sysdash-live.XXXXXX") || return 1
 LIVE_DIR=$dir
+view_init
 if [ "${BASH_VERSINFO[0]:-3}" -ge 4 ] && mkfifo "$dir/nap" 2>/dev/null && exec 9<>"$dir/nap"; then NAP_FD=9; fi
-exec 3<&0                                         # keep the tty on stdin for the renderer's Session row
-live_renderer "$dir" <&3 3<&- &
+SD_TTY_NAME=$(tty 2>/dev/null)                    # the renderer gets /dev/null as stdin: sharing the tty let it swallow keystrokes
+live_renderer "$dir" </dev/null &
 LIVE_BG=$!
-exec 3<&-
 trap 'exit 0' INT TERM HUP
 trap live_stop EXIT
 now_ms; LV_T0=$NOW_MS
@@ -1770,7 +1878,8 @@ read -r seq 2>/dev/null <"$dir/seq"
 if [ -n "$seq" ] && [ "$seq" != "$last_seq" ] && live_load_layout "$dir"; then last_seq=$seq; redraw=1; started=1; fi
 [ "$started" = 1 ] || { sleep 0.05; continue; }
 now_ms; ms=$((NOW_MS - LV_T0)); wake=$((NOW_MS + 50)); LIVE_OUT=""
-[ "$redraw" = 1 ] && LIVE_OUT=$'\033[H'"$LV_STATIC"$'\033[J'
+[ "$SCROLL_DIRTY" = 1 ] && { SCROLL_DIRTY=0; redraw=1; }
+if [ "$redraw" = 1 ]; then view_paint "$LV_ROWS" "$LV_COLS"; LIVE_OUT=$PAINT; fi
 for ((i = 0; i < ${#LV_ID[@]}; i++)); do
 if [ "$redraw" = 1 ] || [ "$NOW_MS" -ge "${LV_NEXT[i]}" ]; then
 live_draw_panel "$i" "$ms"
@@ -1781,7 +1890,8 @@ fi
 [ "${LV_NEXT[i]}" -lt "$wake" ] && wake=${LV_NEXT[i]}
 done
 [ -n "$LIVE_OUT" ] && printf '%s' "$LIVE_OUT"
-now_ms; d=$((wake - NOW_MS)); sleep_ms "$d"
+now_ms; d=$((wake - NOW_MS))
+if [ "$KEYS_OK" = 1 ]; then [ "$d" -lt 2 ] && d=2; view_read_key "$d"; else sleep_ms "$d"; fi   # always poll input, even when behind
 done
 }
 plugin_command_help() {
@@ -1796,7 +1906,7 @@ update|upd|--update) echo "Usage: sysdash update NAME URL   (shorthand: sysdash 
 keys|kyes|key|--keys) echo "Usage: sysdash keys [list|set KEY VALUE|get KEY|unset KEY]"; echo "  sysdash keys            list the names of your stored keys (one per line; values are never shown)"; echo "  sysdash keys set K V    store or replace a key      sysdash keys get K    print a key's value"; echo "  sysdash keys unset K    remove a key"; echo "Keys are stored with mode 600 in $KEYS_FILE and exported to plugins as environment variables."; echo "'kyes' is accepted as an alias for 'keys'.";;
 showcase|--showcase) echo "Usage: sysdash showcase [FLAGS|default] [live|watch [N]]"; echo "Hides sensitive values for screenshots. Everything is hidden unless you allow it with a flag:"; echo "  un/oun=usernames (self/others)   sn/osn=system names   g/og=groups   s/os=sessions"; echo "  em/oem=email   pn/opn=phone   eip/oeip=external IP   iip=internal IPs"; echo "  default          shorthand for: sn osn g og pn opn oeip iip"; echo "Example: sysdash showcase default live";;
 default|--default) echo "Usage: sysdash showcase default [live]"; echo "Shorthand for: sysdash showcase sn osn g og pn opn oeip iip";;
-live|--live) echo "Usage: sysdash live"; echo "Refreshes dashboard data every 0.5 seconds. Plugins that declare SYSDASH_PLUGIN_FPS are"; echo "redrawn in place at up to 30 fps between data refreshes (see: sysdash help api).";;
+live|--live|watch|--watch) echo "Usage: sysdash live | sysdash watch [N]   (combine with showcase: sysdash showcase default live)"; echo "live refreshes data every 0.5 s; watch every N seconds. Plugins that declare SYSDASH_PLUGIN_FPS are"; echo "redrawn in place at up to 30 fps in live mode (see: sysdash help api)."; echo "Scrolling when the dashboard is taller than the window:"; echo "  Up/Down or k/j  line     PgUp/PgDn or b/space  page     Home/End or g/G  top/bottom"; echo "  mouse wheel (most terminals)     q  quit      (requires bash 4+)";;
 api|plugin|plugins|--api) cat <<'APIHELP'
 Plugin API
   Metadata   SYSDASH_PLUGIN_ID="id"  SYSDASH_PLUGIN_NAME="Name"  SYSDASH_PLUGIN_SPAN="auto|half|full"
@@ -1816,7 +1926,6 @@ Plugin API
     - SYSDASH_LIVE=1 is exported to plugins in live mode.
 APIHELP
 ;;
-watch|--watch) echo "Usage: sysdash watch [SECONDS]"; echo "Refreshes the dashboard at the requested interval (default 5 seconds).";;
 no-install|--no-install) echo "Usage: sysdash no-install"; echo "Prevents automatic installation of missing dependencies.";;
 no-daemon|--no-daemon) echo "Usage: sysdash no-daemon"; echo "Does not start or install the background collector.";;
 uninstall|--uninstall) echo "Usage: sysdash uninstall"; echo "Stops and removes the sysdash background collector and its history.";;
@@ -1894,23 +2003,20 @@ load_keys
 load_plugins
 if [ "$OPT_WATCH" = 1 ]; then
 printf '\033[?1049h\033[?25l\033[?7l'      # alt screen, hide cursor, no line-wrap
-if [ "$OPT_LIVE" = 1 ] && [ "$ANIM_COUNT" -gt 0 ] && live_anim_loop; then exit 0; fi   # animated plugins present
+if [ "$OPT_LIVE" = 1 ] && live_anim_loop; then exit 0; fi   # live mode: background renderer + responsive, scrollable viewport
 trap 'exit 0' INT TERM HUP
 trap live_stop EXIT
-local frame
+local frame t0 wait_ms watch_ms
+watch_ms=$(awk -v s="$WATCH_SECS" 'BEGIN{printf "%d", s * 1000}')
+view_init
 while :; do
-local frame_start frame_elapsed frame_wait
-frame_start=$(date +%s%N 2>/dev/null)
+now_ms; t0=$NOW_MS
 frame=$(render_all)
-printf '\033[H%s
-\033[J' "$frame"
-if [ "$OPT_LIVE" = 1 ] && [[ "$frame_start" =~ ^[0-9]+$ ]]; then
-frame_elapsed=$(awk -v a="$frame_start" -v b="$(date +%s%N)" 'BEGIN{printf "%.3f",(b-a)/1000000000}')
-frame_wait=$(awk -v e="$frame_elapsed" 'BEGIN{r=0.5-e; if(r>0) printf "%.3f",r; else print "0"}')
-[ "$frame_wait" != 0 ] && sleep "$frame_wait"
-else
-sleep "$WATCH_SECS"
-fi
+view_set_frame "$frame"; view_term_size
+view_paint "$VIEW_ROWS" "$VIEW_COLS"; printf '%s' "$PAINT"
+if [ "$OPT_LIVE" = 1 ]; then now_ms; wait_ms=$((500 - (NOW_MS - t0))); [ "$wait_ms" -lt 0 ] && wait_ms=0
+else wait_ms=$watch_ms; fi
+view_idle_ms "$wait_ms"
 done
 else
 render_all
